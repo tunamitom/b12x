@@ -152,8 +152,6 @@ def update_prefill_graph_work_metadata_triton(
     slots_per_req = MAX_Q_TILES_PER_REQ * MAX_CHUNKS_PER_Q_TILE
     req_idx = offsets // slots_per_req
     req_local = offsets - req_idx * slots_per_req
-    q_tile_idx = req_local // MAX_CHUNKS_PER_Q_TILE
-    kv_tile_idx = req_local - q_tile_idx * MAX_CHUNKS_PER_Q_TILE
 
     in_block_capacity = offsets < block_valid_capacity
     in_work_capacity = offsets < work_items_capacity
@@ -184,6 +182,20 @@ def update_prefill_graph_work_metadata_triton(
     num_chunks = tl.full((BLOCK_WORK_ITEMS,), 1, tl.int32)
     if SPLIT_KV:
         num_chunks = tl.maximum((effective_pages + chunk_pages - 1) // chunk_pages, 1)
+    # Safety: the work-item grid only has MAX_CHUNKS_PER_Q_TILE slots per q tile.
+    # If the runtime chunk count ever exceeds the primed capacity, clamp so that
+    # o_indptr/merge_indptr stay consistent with the work items actually
+    # scheduled (otherwise the merge consumes uninitialized partial rows).
+    num_chunks = tl.minimum(num_chunks, MAX_CHUNKS_PER_Q_TILE)
+
+    # The forward kernel stores split-KV partials densely as
+    #   token_local * num_chunks + kv_tile_idx
+    # for each request.  CUDA graph replay still reserves the maximum captured
+    # slots per request, but the active runtime work items must be packed by the
+    # runtime chunk count instead of leaving MAX_CHUNKS_PER_Q_TILE-sized gaps.
+    safe_num_chunks = tl.maximum(num_chunks, 1)
+    q_tile_idx = req_local // safe_num_chunks
+    kv_tile_idx = req_local - q_tile_idx * safe_num_chunks
 
     active = (
         usable
@@ -328,10 +340,7 @@ def update_decode_graph_replay_metadata(
     ).clamp_(min=1, max=page_table.shape[1]).to(torch.int64)
     active_max_pages = max_cache_pages.to(torch.int32)
     if window_page_span > 0:
-        effective_max_pages = torch.minimum(
-            max_cache_pages,
-            torch.tensor(int(window_page_span), dtype=torch.int64, device=max_cache_pages.device),
-        )
+        effective_max_pages = max_cache_pages.clamp(max=int(window_page_span))
     else:
         effective_max_pages = max_cache_pages
     effective_max_pages = effective_max_pages.clamp_(min=1, max=decode_chunk_pages_lut.shape[0] - 1)
@@ -414,10 +423,7 @@ def update_regular_decode_graph_replay_metadata(
     ).clamp_(min=1, max=page_table.shape[1]).to(torch.int64)
     active_max_pages = max_cache_pages.to(torch.int32)
     if window_page_span > 0:
-        effective_max_pages = torch.minimum(
-            max_cache_pages,
-            torch.tensor(int(window_page_span), dtype=torch.int64, device=max_cache_pages.device),
-        )
+        effective_max_pages = max_cache_pages.clamp(max=int(window_page_span))
     else:
         effective_max_pages = max_cache_pages
     effective_max_pages = effective_max_pages.clamp_(min=1, max=decode_chunk_pages_lut.shape[0] - 1)
@@ -593,10 +599,7 @@ def update_decode_graph_chunk_metadata(
         rounding_mode="floor",
     ).clamp_(min=1, max=decode_chunk_pages_lut.shape[0] - 1).to(torch.int64)
     if window_page_span > 0:
-        effective_max_pages = torch.minimum(
-            max_cache_pages,
-            torch.tensor(int(window_page_span), dtype=torch.int64, device=max_cache_pages.device),
-        )
+        effective_max_pages = max_cache_pages.clamp(max=int(window_page_span))
     else:
         effective_max_pages = max_cache_pages
     effective_max_pages = effective_max_pages.clamp_(min=1, max=decode_chunk_pages_lut.shape[0] - 1)

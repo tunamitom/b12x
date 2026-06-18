@@ -67,6 +67,7 @@ def cutlass_to_torch_dtype(cutlass_dtype):
         cutlass.BFloat16: torch.bfloat16,
         cutlass.Float8E5M2: torch.float8_e5m2,
         cutlass.Float8E4M3FN: torch.float8_e4m3fn,
+        cutlass.Float8E8M0FNU: torch.float8_e8m0fnu,
         cutlass.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
         cutlass.Float4E2M1FN: torch.float4_e2m1fn_x2,  # FP4 packed (2 values per byte)
     }
@@ -78,10 +79,19 @@ def cutlass_to_torch_dtype(cutlass_dtype):
     return torch_dtype
 
 
-@functools.cache
+_num_sm_cache: dict[int, int] = {}
+
+
 def get_num_sm(device: torch.device) -> int:
-    # get the compute capability of the device, which would be cached
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    """Return the device SM count without exposing lru_cache to Dynamo."""
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    sm_count = _num_sm_cache.get(index)
+    if sm_count is None:
+        sm_count = torch.cuda.get_device_properties(index).multi_processor_count
+        _num_sm_cache[index] = sm_count
+    return sm_count
 
 
 @torch._dynamo.disable
@@ -447,8 +457,8 @@ def sm120_make_smem_layout_sfa(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
-    assert tile_shape_mnk[0] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[0] must be divisible by 64"
+    assert tile_shape_mnk[0] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[0] must be divisible by 16"
     )
 
     # Scale-factor tiles are quantized in 128-row blocks, so narrower MMA
@@ -524,8 +534,8 @@ def sm120_make_smem_layout_sfb(
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
-    assert tile_shape_mnk[1] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[1] must be divisible by 64"
+    assert tile_shape_mnk[1] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[1] must be divisible by 16"
     )
 
     assert tile_shape_mnk[2] % sf_vec_size == 0, (

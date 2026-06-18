@@ -13,7 +13,9 @@ from .planner import (
     PagedPlanBudget,
     build_decode_chunk_pages_lut,
     create_paged_plan,
+    decode_graph_max_chunks_per_request_budget,
     infer_paged_mode,
+    resolve_decode_graph_ctas_per_sm,
 )
 
 _ARENA_ALIGN_BYTES = 1024
@@ -40,6 +42,13 @@ def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"alignment must be positive, got {alignment}")
     return ((int(value) + alignment - 1) // alignment) * alignment
+
+
+def _infer_mode_from_host_total(
+    cu_seqlens_q: torch.Tensor, active_total_q: int
+) -> Literal["decode", "extend"]:
+    batch = max(int(cu_seqlens_q.shape[0]) - 1, 0)
+    return "decode" if batch > 0 and int(active_total_q) == batch else "extend"
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -317,7 +326,7 @@ class PagedAttentionArena:
     def required_nbytes(cls, caps: PagedAttentionArenaCaps) -> int:
         return cls._layout(caps).arena_nbytes
 
-    def make_workspace(
+    def _make_workspace_views(
         self,
         contract: PagedAttentionWorkspaceContract,
         *,
@@ -427,6 +436,17 @@ class PagedAttentionArena:
             partial_rows_capacity=contract.max_partial_rows,
         )
         return workspace
+
+    def make_workspace(
+        self,
+        contract: PagedAttentionWorkspaceContract,
+        *,
+        use_cuda_graph: bool = False,
+    ) -> "PagedAttentionWorkspace":
+        return self._make_workspace_views(
+            contract,
+            use_cuda_graph=use_cuda_graph,
+        )
 
 
 @dataclass(kw_only=True)
@@ -740,6 +760,7 @@ class PagedAttentionWorkspace:
                     return False
         return True
 
+    @torch._dynamo.disable
     def prepare(
         self,
         page_table: torch.Tensor,
@@ -748,7 +769,9 @@ class PagedAttentionWorkspace:
         *,
         fixed_split_size: int | None = None,
         disable_split_kv: bool = False,
+        causal: bool = True,
         window_left: int = -1,
+        active_total_q: int | None = None,
     ) -> PagedAttentionWorkspace:
         with record_function(f"paged_workspace.prepare.{self.mode}"):
             if window_left < -1:
@@ -765,6 +788,11 @@ class PagedAttentionWorkspace:
                         f"captured paged attention graph was prepared with window_left={self._plan.window_left}, "
                         f"got window_left={int(window_left)}"
                     )
+                if bool(causal) != bool(self._plan.causal):
+                    raise ValueError(
+                        f"captured paged attention graph was prepared with causal={self._plan.causal}, "
+                        f"got causal={bool(causal)}"
+                    )
                 with record_function("paged_workspace.copy_runtime_metadata.capture"):
                     self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 return self
@@ -780,6 +808,11 @@ class PagedAttentionWorkspace:
                         f"decode graph replay workspace was prepared with window_left={self._plan.window_left}, "
                         f"got window_left={int(window_left)}"
                     )
+                if bool(causal) != bool(self._plan.causal):
+                    raise ValueError(
+                        f"decode graph replay workspace was prepared with causal={self._plan.causal}, "
+                        f"got causal={bool(causal)}"
+                    )
                 with record_function("paged_workspace.copy_runtime_metadata"):
                     self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 if not self._decode_graph_metadata_captured_in_graph:
@@ -787,10 +820,19 @@ class PagedAttentionWorkspace:
                         "paged_workspace.update_decode_graph_replay_metadata"
                     ):
                         self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+                    if torch.cuda.is_current_stream_capturing():
+                        self._decode_graph_metadata_captured_in_graph = True
                 return self
 
-            with record_function("paged_workspace.infer_mode"):
-                inferred_mode = infer_paged_mode(cu_seqlens_q)
+            if active_total_q is None:
+                with record_function("paged_workspace.infer_mode"):
+                    inferred_mode = infer_paged_mode(cu_seqlens_q)
+                active_total_q = int(cu_seqlens_q[-1].item())
+            else:
+                active_total_q = int(active_total_q)
+                inferred_mode = _infer_mode_from_host_total(
+                    cu_seqlens_q, active_total_q
+                )
             if (
                 inferred_mode != self.mode
                 and not (self.mode == "extend" and inferred_mode == "decode")
@@ -799,7 +841,6 @@ class PagedAttentionWorkspace:
                 raise ValueError(
                     f"workspace mode {self.mode} does not match prepared mode {inferred_mode}"
                 )
-            active_total_q = int(cu_seqlens_q[-1].item())
             with record_function("paged_workspace.ensure_plan_contract"):
                 self._ensure_plan_contract(active_total_q)
             assert self._plan_q is not None
@@ -823,6 +864,7 @@ class PagedAttentionWorkspace:
                     if fixed_split_size is None
                     else int(fixed_split_size),
                     disable_split_kv=disable_split_kv,
+                    causal=bool(causal),
                     window_left=int(window_left),
                     enable_cuda_graph=self.use_cuda_graph,
                     graph_chunk_policy=self.use_cuda_graph,
@@ -883,30 +925,15 @@ class PagedAttentionWorkspace:
         window_page_span = self._window_page_span_from_plan(self._plan)
 
         if self._use_regular_decode_graph_replay:
-            from .graph_replay import update_regular_decode_graph_chunk_metadata
+            from .graph_replay import update_regular_decode_graph_chunk_metadata_from_lut
 
-            max_cache_pages = torch.div(
-                self.cache_seqlens.amax() + (self.page_size - 1),
-                self.page_size,
-                rounding_mode="floor",
-            ).clamp_(min=1, max=self._decode_graph_chunk_pages_lut.shape[0] - 1)
-            decode_chunk_pages = torch.index_select(
-                self._decode_graph_chunk_pages_lut,
-                0,
-                max_cache_pages.to(torch.int64).view(1),
-            )
-            kv_chunk_size = (decode_chunk_pages * self.page_size).to(torch.int32)
-            max_chunks_per_req = int(
-                self.request_indices.shape[0] // self.cache_seqlens.shape[0]
-            )
-            update_regular_decode_graph_chunk_metadata(
+            update_regular_decode_graph_chunk_metadata_from_lut(
                 cache_seqlens=self.cache_seqlens,
                 merge_indptr=self.merge_indptr,
                 o_indptr=self.o_indptr,
                 kv_chunk_size_ptr=self.kv_chunk_size_ptr,
-                kv_chunk_size=kv_chunk_size,
                 kv_window_start_tokens=self.kv_window_start_tokens,
-                max_chunks_per_req=max_chunks_per_req,
+                decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
                 page_size=self.page_size,
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
@@ -929,8 +956,6 @@ class PagedAttentionWorkspace:
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
             )
-        if not torch.cuda.is_current_stream_capturing():
-            self.total_num_rows_ptr[0] = int(self._plan.total_q)
         return self
 
     def update_prefill_graph_replay_metadata(
@@ -939,6 +964,7 @@ class PagedAttentionWorkspace:
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         *,
+        causal: bool = True,
         window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
@@ -955,6 +981,11 @@ class PagedAttentionWorkspace:
             raise ValueError(
                 f"prefill graph replay workspace was prepared with window_left={self._plan.window_left}, "
                 f"got window_left={int(window_left)}"
+            )
+        if bool(causal) != bool(self._plan.causal):
+            raise ValueError(
+                f"prefill graph replay workspace was prepared with causal={self._plan.causal}, "
+                f"got causal={bool(causal)}"
             )
         if self.page_table is None:
             raise RuntimeError("prefill graph workspace is missing page_table")
@@ -977,6 +1008,7 @@ class PagedAttentionWorkspace:
         *,
         fixed_split_size: int | None = None,
         disable_split_kv: bool = False,
+        active_total_q: int | None = None,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
             raise RuntimeError(
@@ -988,6 +1020,7 @@ class PagedAttentionWorkspace:
             cu_seqlens_q,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            active_total_q=active_total_q,
         )
 
     def bind_cuda_graph_runtime_metadata(
@@ -1063,30 +1096,32 @@ class PagedAttentionWorkspace:
                     // self.page_size,
                 ),
             )
-        try:
-            decode_chunk_pages_lut = build_decode_chunk_pages_lut(
-                q_dtype=self.dtype,
-                kv_dtype=self.kv_dtype,
-                batch=batch,
-                page_size=self.page_size,
-                head_dim_qk=self.head_dim_qk,
-                head_dim_vo=self.head_dim_vo,
-                gqa_group_size=self.num_q_heads // self.num_kv_heads,
-                max_effective_kv_pages=max_effective_kv_pages,
-            )
-        except KeyError:
-            self._decode_graph_chunk_pages_lut = None
-            self._decode_graph_max_chunks_per_req = None
-            self._use_regular_decode_graph_replay = False
-            self._decode_graph_metadata_captured_in_graph = False
-            self.prepare_for_capacity(
-                batch=batch,
-                total_q_capacity=total_q_capacity,
-                max_page_table_width=max_page_table_width,
-                max_cache_seqlen=max_cache_page_count * self.page_size,
-                window_left=window_left,
-            )
-            return self
+        gqa_group_size = self.num_q_heads // self.num_kv_heads
+        graph_ctas_per_sm = resolve_decode_graph_ctas_per_sm(
+            kv_dtype=self.kv_dtype,
+            batch=batch,
+            page_size=self.page_size,
+            head_dim_qk=self.head_dim_qk,
+            head_dim_vo=self.head_dim_vo,
+            gqa_group_size=gqa_group_size,
+        )
+        max_chunks_per_req_budget = decode_graph_max_chunks_per_request_budget(
+            device=self.device,
+            num_kv_heads=self.num_kv_heads,
+            batch=batch,
+            graph_ctas_per_sm=graph_ctas_per_sm,
+        )
+        decode_chunk_pages_lut = build_decode_chunk_pages_lut(
+            q_dtype=self.dtype,
+            kv_dtype=self.kv_dtype,
+            batch=batch,
+            page_size=self.page_size,
+            head_dim_qk=self.head_dim_qk,
+            head_dim_vo=self.head_dim_vo,
+            gqa_group_size=gqa_group_size,
+            max_effective_kv_pages=max_effective_kv_pages,
+            max_chunks_per_req=max_chunks_per_req_budget,
+        )
         worst_page_count, max_chunks_per_req = summarize_decode_chunk_pages_lut(
             decode_chunk_pages_lut
         )
@@ -1096,6 +1131,7 @@ class PagedAttentionWorkspace:
         )
         self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
         self._use_regular_decode_graph_replay = False
+        self._decode_graph_metadata_captured_in_graph = False
         capacity_cache_seqlen = worst_page_count * self.page_size
         if window_left >= 0:
             capacity_cache_seqlen = max_cache_page_count * self.page_size - 1
@@ -1105,6 +1141,11 @@ class PagedAttentionWorkspace:
             max_page_table_width=max_page_table_width,
             max_cache_seqlen=capacity_cache_seqlen,
             window_left=window_left,
+        )
+        self._use_regular_decode_graph_replay = (
+            self._plan is not None
+            and int(self._plan.gqa_group_size) <= 8
+            and self._plan_has_regular_decode_graph_grid(self._plan)
         )
         self._validate_decode_graph_replay_capacity(batch=batch)
         return self
@@ -1117,6 +1158,7 @@ class PagedAttentionWorkspace:
         max_page_table_width: int,
         max_cache_seqlen: int,
         cu_seqlens_q: torch.Tensor,
+        causal: bool = True,
         window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
@@ -1142,9 +1184,21 @@ class PagedAttentionWorkspace:
         if tuple(cu_seqlens_q.shape) != (int(batch) + 1,):
             raise ValueError("cu_seqlens_q shape must match the graph batch")
 
+        # Prime with the worst-case *unaligned* cache length. A page-aligned
+        # max_cache_seqlen underestimates a sliding window's page span by one:
+        # e.g. window_left=128, q_len=8, page=64 spans 3 pages when the cache
+        # length is page-aligned but 4 pages when cache % page in [1, q_len).
+        # Using the largest value <= max_cache_seqlen with residue 1 makes the
+        # capacity plan cover the worst case for both full and windowed layers
+        # (full-attention page counts are unchanged by this adjustment).
+        max_cache_seqlen_worst = int(max_cache_seqlen)
+        if self.page_size > 1 and max_cache_seqlen_worst > self.page_size:
+            max_cache_seqlen_worst = (
+                (max_cache_seqlen_worst - 1) // self.page_size
+            ) * self.page_size + 1
         max_cache_seqlens = torch.full(
             (batch,),
-            int(max_cache_seqlen),
+            int(max_cache_seqlen_worst),
             dtype=torch.int32,
             device=self.device,
         )
@@ -1163,7 +1217,9 @@ class PagedAttentionWorkspace:
             max_page_table,
             max_cache_seqlens,
             cu_seqlens_q,
+            causal=bool(causal),
             window_left=window_left,
+            active_total_q=total_q_capacity,
         )
         self._cache_prefill_graph_replay_shape_from_plan()
         return self
@@ -1175,6 +1231,7 @@ class PagedAttentionWorkspace:
         total_q_capacity: int,
         max_page_table_width: int,
         max_cache_seqlen: int,
+        causal: bool = True,
         window_left: int = -1,
     ) -> PagedAttentionWorkspace:
         if batch <= 0:
@@ -1186,9 +1243,21 @@ class PagedAttentionWorkspace:
         if max_cache_seqlen <= 0:
             raise ValueError("max_cache_seqlen must be positive")
 
+        # Prime with the worst-case *unaligned* cache length. A page-aligned
+        # max_cache_seqlen underestimates a sliding window's page span by one:
+        # e.g. window_left=128, q_len=8, page=64 spans 3 pages when the cache
+        # length is page-aligned but 4 pages when cache % page in [1, q_len).
+        # Using the largest value <= max_cache_seqlen with residue 1 makes the
+        # capacity plan cover the worst case for both full and windowed layers
+        # (full-attention page counts are unchanged by this adjustment).
+        max_cache_seqlen_worst = int(max_cache_seqlen)
+        if self.page_size > 1 and max_cache_seqlen_worst > self.page_size:
+            max_cache_seqlen_worst = (
+                (max_cache_seqlen_worst - 1) // self.page_size
+            ) * self.page_size + 1
         max_cache_seqlens = torch.full(
             (batch,),
-            int(max_cache_seqlen),
+            int(max_cache_seqlen_worst),
             dtype=torch.int32,
             device=self.device,
         )
@@ -1211,7 +1280,9 @@ class PagedAttentionWorkspace:
             max_page_table,
             max_cache_seqlens,
             max_cu_seqlens_q,
+            causal=bool(causal),
             window_left=window_left,
+            active_total_q=batch if self.mode == "decode" else total_q_capacity,
         )
 
     def _build_capacity_cu_seqlens_q(
@@ -1339,9 +1410,45 @@ class PagedAttentionWorkspace:
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
             )
-        if not torch.cuda.is_current_stream_capturing():
-            self.total_num_rows_ptr[0] = int(self._plan.total_q)
         return self
+
+    def bind_paged_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+        page_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        fixed_split_size: int | None = None,
+        disable_split_kv: bool = False,
+        window_left: int = -1,
+        active_total_q: int | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+        attention_sink_bias: torch.Tensor | None = None,
+    ):
+        from b12x.integration.paged_attention_scratch import build_paged_attention_binding
+
+        return build_paged_attention_binding(
+            workspace=self,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            window_left=window_left,
+            active_total_q=active_total_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+        )
 
     @torch._dynamo.disable
     def run(
@@ -1816,6 +1923,16 @@ class PagedAttentionWorkspace:
         assert self.page_table is not None
         assert self.cache_seqlens is not None
         assert self.cu_seqlens_q is not None
+
+        if (
+            page_table.dtype == torch.int32
+            and cache_seqlens.dtype == torch.int32
+            and cu_seqlens_q.dtype == torch.int32
+            and int(self.page_table.data_ptr()) == int(page_table.data_ptr())
+            and int(self.cache_seqlens.data_ptr()) == int(cache_seqlens.data_ptr())
+            and int(self.cu_seqlens_q.data_ptr()) == int(cu_seqlens_q.data_ptr())
+        ):
+            return
 
         with record_function("paged_workspace.runtime_cast_metadata"):
             page_table_i32 = (

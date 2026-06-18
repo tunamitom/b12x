@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from functools import lru_cache
 import os
-import warnings
 
 import cuda.bindings.driver as cuda
 import cutlass
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.runtime_control import raise_if_kernel_resolution_frozen
+from b12x.cute.compiler import DimKey, KernelCompileSpec, launch as b12x_launch
 from b12x.cute.utils import current_cuda_stream
 
 from .forward_paged import (
@@ -23,7 +21,6 @@ from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
-_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
 _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
 
@@ -207,96 +204,26 @@ def _get_cached_plane_tma_descs(
 
 def _tensor_meta_key(
     tensor: torch.Tensor | None,
-) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]] | None:
+    *,
+    dynamic_dims: tuple[int, ...] = (),
+    dynamic_strides: tuple[int, ...] = (),
+) -> tuple[tuple[object, ...], tuple[object, ...], str, tuple[str, int | None]] | None:
     if tensor is None:
         return None
+    dynamic_dim_set = set(dynamic_dims)
+    dynamic_stride_set = set(dynamic_strides)
     return (
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
+        tuple(
+            DimKey.dynamic() if idx in dynamic_dim_set else int(dim)
+            for idx, dim in enumerate(tensor.shape)
+        ),
+        tuple(
+            DimKey.dynamic() if idx in dynamic_stride_set else int(stride)
+            for idx, stride in enumerate(tensor.stride())
+        ),
         str(tensor.dtype),
         (tensor.device.type, tensor.device.index),
     )
-
-
-def _format_cache_key_value(value: object) -> str:
-    if value is None:
-        return "None"
-    if (
-        isinstance(value, tuple)
-        and len(value) == 4
-        and isinstance(value[0], tuple)
-        and isinstance(value[1], tuple)
-        and isinstance(value[2], str)
-        and isinstance(value[3], tuple)
-        and len(value[3]) == 2
-    ):
-        shape, stride, dtype, (device_type, device_index) = value
-        return f"shape={shape},stride={stride},dtype={dtype},device={device_type}:{device_index}"
-    return repr(value)
-
-
-def _debug_print_compile_cache_miss(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    cache_key_labels: tuple[str, ...] | None,
-) -> None:
-    kernel_name = type(kernel).__name__
-    if cache_key_labels is None:
-        payload = ", ".join(
-            f"{idx}={_format_cache_key_value(value)}"
-            for idx, value in enumerate(cache_key)
-        )
-    else:
-        payload = ", ".join(
-            f"{label}={_format_cache_key_value(value)}"
-            for label, value in zip(cache_key_labels, cache_key, strict=True)
-        )
-    print(f"[paged] compile-miss {kernel_name}: {payload}", flush=True)
-
-
-def _launcher_cache_lookup(
-    kernel: object,
-    cache_key: tuple[object, ...],
-):
-    cache = getattr(kernel, "_eager_host_launchers", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(kernel, "_eager_host_launchers", cache)
-        return cache, None
-    compiled = cache.get(cache_key)
-    if compiled is not None:
-        cache.move_to_end(cache_key)
-    return cache, compiled
-
-
-def _run_cached_host_launcher(
-    kernel: object,
-    cache_key: tuple[object, ...],
-    args: tuple[object, ...],
-    *,
-    cache_key_labels: tuple[str, ...] | None = None,
-) -> None:
-    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
-    if compiled is None:
-        if os.environ.get("B12X_PAGED_DEBUG_COMPILE", "0") == "1":
-            _debug_print_compile_cache_miss(kernel, cache_key, cache_key_labels)
-        raise_if_kernel_resolution_frozen(
-            "eager host launcher compile",
-            target=kernel,
-            cache_key=cache_key,
-        )
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Cache is disabled as user wants to compile only.",
-                category=UserWarning,
-            )
-            compiled = kernel(*args, compile_only=True)
-        cache[cache_key] = compiled
-        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
-            cache.popitem(last=False)
-    exe_args, _ = compiled.generate_execution_args(*args)
-    compiled.run_compiled_program(exe_args)
 
 
 @lru_cache(maxsize=64)
@@ -339,6 +266,7 @@ def _build_extend_forward_kernel(
     traits: PagedForwardTraits,
     use_native_fp8_qk: bool,
     use_native_fp8_pv: bool,
+    causal: bool,
     window_left: int,
     has_attention_sink_bias: bool,
 ) -> object:
@@ -346,6 +274,7 @@ def _build_extend_forward_kernel(
         traits,
         use_native_fp8_qk,
         use_native_fp8_pv,
+        causal=causal,
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
     )
@@ -355,12 +284,16 @@ def _build_extend_forward_kernel(
 def _build_merge_kernel(
     dtype: torch.dtype,
     head_dim: int,
+    total_q: int,
     persistent_ctas: int,
     direct_grid: bool,
     regular_decode_graph: bool,
+    pair_bf16_partial_loads: bool,
 ) -> PagedPersistentMergeKernel:
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
-    merge_bdy = 4
+    merge_bdy = 3 if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph else 4
+    if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph and int(total_q) == 4:
+        merge_bdy = 4
     return PagedPersistentMergeKernel(
         cutlass_dtype,
         cutlass_dtype,
@@ -370,20 +303,103 @@ def _build_merge_kernel(
         persistent_ctas=persistent_ctas,
         direct_grid=direct_grid,
         regular_decode_graph=regular_decode_graph,
+        pair_bf16_partial_loads=pair_bf16_partial_loads,
+    )
+
+
+def _resolve_paged_attention_binding(
+    *,
+    binding,
+    q: torch.Tensor | None,
+    k_cache: torch.Tensor | None,
+    v_cache: torch.Tensor | None,
+    workspace: PagedAttentionWorkspace | None,
+    output: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    attention_sink_bias: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    PagedAttentionWorkspace,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    if binding is None:
+        missing = [
+            name
+            for name, value in (
+                ("q", q),
+                ("k_cache", k_cache),
+                ("v_cache", v_cache),
+                ("workspace", workspace),
+                ("output", output),
+            )
+            if value is None
+        ]
+        if missing:
+            raise TypeError(f"missing required paged attention arguments: {', '.join(missing)}")
+        return q, k_cache, v_cache, workspace, output, k_descale, v_descale, attention_sink_bias
+
+    extras = [
+        name
+        for name, value in (
+            ("q", q),
+            ("k_cache", k_cache),
+            ("v_cache", v_cache),
+            ("workspace", workspace),
+            ("output", output),
+            ("k_descale", k_descale),
+            ("v_descale", v_descale),
+            ("attention_sink_bias", attention_sink_bias),
+        )
+        if value is not None
+    ]
+    if extras:
+        raise ValueError(
+            "paged attention binding owns runtime tensors and workspace; "
+            f"do not also pass {', '.join(extras)}"
+        )
+    return (
+        binding.q,
+        binding.k_cache,
+        binding.v_cache,
+        binding.workspace,
+        binding.output,
+        binding.k_descale,
+        binding.v_descale,
+        binding.attention_sink_bias,
     )
 
 
 def paged_attention_forward(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    q: torch.Tensor | None = None,
+    k_cache: torch.Tensor | None = None,
+    v_cache: torch.Tensor | None = None,
     *,
-    workspace: PagedAttentionWorkspace,
-    output: torch.Tensor,
+    workspace: PagedAttentionWorkspace | None = None,
+    output: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
+    binding=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k_cache, v_cache, workspace, output, k_descale, v_descale, attention_sink_bias = (
+        _resolve_paged_attention_binding(
+            binding=binding,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            workspace=workspace,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            attention_sink_bias=attention_sink_bias,
+        )
+    )
     plan = workspace.plan
     page_table = workspace.page_table
     cache_seqlens = workspace.cache_seqlens
@@ -448,6 +464,7 @@ def paged_attention_forward(
             traits,
             use_native_fp8_qk,
             use_native_fp8_pv,
+            plan.causal,
             plan.window_left,
             has_attention_sink_bias,
         )
@@ -617,25 +634,31 @@ def paged_attention_forward(
         if use_capacity_contract and workspace._plan_output is not None
         else forward_output
     )
+    forward_lse_dynamic_dims = (0,) if plan.split_kv else (1,)
+    forward_lse_dynamic_strides = () if plan.split_kv else (0,)
     forward_cache_key = [
-        _tensor_meta_key(q_cache_tensor),
+        _tensor_meta_key(q_cache_tensor, dynamic_dims=(0,)),
         _tensor_meta_key(k_cache),
         _tensor_meta_key(v_cache),
-        _tensor_meta_key(page_table),
-        _tensor_meta_key(cache_seqlens),
-        _tensor_meta_key(cu_seqlens_q),
-        _tensor_meta_key(workspace.request_indices),
-        _tensor_meta_key(workspace.qo_tile_indices),
-        _tensor_meta_key(workspace.kv_tile_indices),
-        _tensor_meta_key(workspace.o_indptr),
+        _tensor_meta_key(page_table, dynamic_dims=(0,)),
+        _tensor_meta_key(cache_seqlens, dynamic_dims=(0,)),
+        _tensor_meta_key(cu_seqlens_q, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.request_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.qo_tile_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.kv_tile_indices, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.o_indptr, dynamic_dims=(0,)),
         _tensor_meta_key(workspace.kv_chunk_size_ptr),
-        _tensor_meta_key(workspace.kv_window_start_tokens),
-        _tensor_meta_key(workspace.block_valid_mask),
+        _tensor_meta_key(workspace.kv_window_start_tokens, dynamic_dims=(0,)),
+        _tensor_meta_key(workspace.block_valid_mask, dynamic_dims=(0,)),
         _tensor_meta_key(attention_sink_bias),
-        _tensor_meta_key(output_cache_tensor),
-        _tensor_meta_key(forward_lse),
-        _tensor_meta_key(k_descale),
-        _tensor_meta_key(v_descale),
+        _tensor_meta_key(output_cache_tensor, dynamic_dims=(0,)),
+        _tensor_meta_key(
+            forward_lse,
+            dynamic_dims=forward_lse_dynamic_dims,
+            dynamic_strides=forward_lse_dynamic_strides,
+        ),
+        _tensor_meta_key(k_descale, dynamic_dims=(0,)),
+        _tensor_meta_key(v_descale, dynamic_dims=(0,)),
     ]
     cache_key_labels = [
         "q_contract" if use_capacity_contract else "q",
@@ -693,11 +716,17 @@ def paged_attention_forward(
         )
         cache_key_labels.extend(("k_tma_desc_ptrs", "v_tma_desc_ptrs"))
     forward_args.append(stream)
-    _run_cached_host_launcher(
-        forward_kernel,
+    forward_spec = KernelCompileSpec.from_key(
+        "attention.paged.forward",
+        1,
         tuple(forward_cache_key),
-        tuple(forward_args),
-        cache_key_labels=tuple(cache_key_labels),
+        labels=tuple(cache_key_labels),
+    )
+    b12x_launch(
+        forward_kernel,
+        compile_spec=forward_spec,
+        compile_args=tuple(forward_args),
+        runtime_args=tuple(forward_args),
     )
 
     if plan.split_kv:
@@ -715,12 +744,23 @@ def paged_attention_forward(
             and max(plan.qo_tile_indices, default=0) == 0
         )
         merge_direct_grid = merge_regular_decode_graph
+        pair_bf16_merge_partial_loads = (
+            plan.mode == "decode"
+            and 2 <= int(plan.total_q) <= 4
+            and output.dtype == torch.bfloat16
+            and workspace.tmp_output is not None
+            and workspace.tmp_output.dtype == torch.bfloat16
+            and plan.head_dim_vo == 128
+            and plan.gqa_group_size == 6
+        )
         merge_kernel = _build_merge_kernel(
             output.dtype,
             plan.head_dim_vo,
+            plan.total_q,
             persistent_ctas,
             merge_direct_grid,
             merge_regular_decode_graph,
+            pair_bf16_merge_partial_loads,
         )
         tmp_output_arg = _to_kernel_tensor(
             workspace.tmp_output, _torch_to_cutlass_dtype(workspace.tmp_output.dtype)
@@ -752,25 +792,30 @@ def paged_attention_forward(
             total_num_rows_arg,
         )
         merge_cache_key = (
-            _tensor_meta_key(workspace.tmp_output),
-            _tensor_meta_key(workspace.tmp_lse),
-            _tensor_meta_key(workspace.merge_indptr),
-            _tensor_meta_key(cache_seqlens),
+            _tensor_meta_key(workspace.tmp_output, dynamic_dims=(0,)),
+            _tensor_meta_key(workspace.tmp_lse, dynamic_dims=(0,)),
+            _tensor_meta_key(workspace.merge_indptr, dynamic_dims=(0,)),
+            _tensor_meta_key(cache_seqlens, dynamic_dims=(0,)),
             _tensor_meta_key(workspace.kv_chunk_size_ptr),
-            _tensor_meta_key(output),
-            _tensor_meta_key(workspace.lse),
+            _tensor_meta_key(output, dynamic_dims=(0,)),
+            _tensor_meta_key(
+                workspace.lse,
+                dynamic_dims=(1,),
+                dynamic_strides=(0,),
+            ),
             None
             if merge_regular_decode_graph
             else _tensor_meta_key(workspace.total_num_rows_ptr),
             persistent_ctas,
             merge_direct_grid,
             merge_regular_decode_graph,
+            pair_bf16_merge_partial_loads,
         )
-        _run_cached_host_launcher(
-            merge_kernel,
+        merge_spec = KernelCompileSpec.from_key(
+            "attention.paged.merge",
+            1,
             merge_cache_key,
-            (*merge_args, stream),
-            cache_key_labels=(
+            labels=(
                 "tmp_output",
                 "tmp_lse",
                 "merge_indptr",
@@ -782,7 +827,14 @@ def paged_attention_forward(
                 "persistent_ctas",
                 "direct_grid",
                 "regular_decode_graph",
+                "pair_bf16_partial_loads",
             ),
+        )
+        b12x_launch(
+            merge_kernel,
+            compile_spec=merge_spec,
+            compile_args=(*merge_args, stream),
+            runtime_args=(*merge_args, stream),
         )
 
     return output[: plan.total_q], workspace.current_lse_view()

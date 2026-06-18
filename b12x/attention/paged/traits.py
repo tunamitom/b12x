@@ -170,7 +170,7 @@ def select_paged_forward_traits(
     if (
         kv_dtype == _FP8_KV_DTYPE
         and cta_tile_q == 16
-        and head_dim_qk == 192
+        and head_dim_qk in (128, 192)
         and head_dim_vo == 128
     ):
         num_mma_kv = min(num_mma_kv, 1)
@@ -190,7 +190,18 @@ def select_paged_forward_traits(
     k_smem_bytes = cta_tile_kv * upcast_stride_k * 16
     v_smem_bytes = cta_tile_kv * upcast_stride_v * 16
     qkv_storage_bytes = q_smem_bytes + k_smem_bytes + v_smem_bytes
-    cta_sync_o_bytes = 4 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * head_dim_vo * 4
+    sync_o_row_stride = head_dim_vo + (
+        24
+        if (
+            kv_dtype != _FP8_KV_DTYPE
+            and o_dtype == torch.bfloat16
+            and cta_tile_q == 16
+        )
+        else 0
+    )
+    cta_sync_o_bytes = (
+        4 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * sync_o_row_stride * 4
+    )
     cta_sync_md_bytes = 8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
     cta_sync_storage_bytes = cta_sync_o_bytes + cta_sync_md_bytes
     smem_o_bytes = cta_tile_q * head_dim_vo * o_bytes
