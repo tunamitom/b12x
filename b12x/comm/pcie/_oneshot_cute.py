@@ -300,6 +300,14 @@ class _OneshotLaunch(_PackedMath):
         plain_local_slot1: Int64,
         plain_peer_slot1: Int64,
     ) -> None:
+        # Programmatic dependent launch: a dependent kernel launched with the
+        # programmatic-stream-serialization attribute may start now (its own
+        # griddepcontrol.wait still orders its reads of this kernel's output
+        # after this grid completes). A weight-streaming dependent can then
+        # stage its weights while the fabric round trips of this allreduce keep
+        # the HBM idle. Must stay the first statement so the trigger fires
+        # before any peer wait.
+        cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -919,6 +927,9 @@ class _FusedOneshotLaunch(_PackedMath):
         shard_packs: Int64,
         epsilon: Float32,
     ) -> None:
+        # Programmatic dependent launch trigger; see the plain kernel above.
+        # Must stay the first statement.
+        cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
