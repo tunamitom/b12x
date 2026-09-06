@@ -808,6 +808,7 @@ class _FusedOneshotLaunch(_PackedMath):
         input_base: Int64,
         residual_base: Int64,
         index: Int64,
+        residual_index: Int64,
         total_packs: Int64,
         shard_packs: Int64,
         accumulator: cute.Tensor,
@@ -872,7 +873,7 @@ class _FusedOneshotLaunch(_PackedMath):
                 )
         self._load_accumulate(
             accumulator,
-            residual_base + index * Int64(16),
+            residual_base + residual_index * Int64(16),
             False,
         )
 
@@ -909,6 +910,8 @@ class _FusedOneshotLaunch(_PackedMath):
         hidden_packs: Int32,
         rows: Int32,
         ctas_per_row: Int32,
+        residual_row_stride_packs: Int64,
+        residual_output_row_stride_packs: Int64,
         shard_packs: Int64,
         epsilon: Float32,
     ) -> None:
@@ -1013,6 +1016,7 @@ class _FusedOneshotLaunch(_PackedMath):
                 col = col0 + Int32(pack_number) * col_stride
                 if col < hidden_packs:
                     index = row_offset + Int64(col)
+                    residual_index = Int64(row) * residual_row_stride_packs + Int64(col)
                     accumulator = cute.make_rmem_tensor(
                         (self._pack_elems,), cutlass.Float32
                     )
@@ -1021,12 +1025,16 @@ class _FusedOneshotLaunch(_PackedMath):
                         input_base,
                         residual_base,
                         index,
+                        residual_index,
                         total_packs,
                         shard_packs,
                         accumulator,
                     )
                     self._store_accumulator(
-                        residual_output_base + index * Int64(16), accumulator
+                        residual_output_base
+                        + (Int64(row) * residual_output_row_stride_packs + Int64(col))
+                        * Int64(16),
+                        accumulator,
                     )
                     for lane in cutlass.range_constexpr(self._pack_elems):
                         value = accumulator[lane]
@@ -1036,6 +1044,7 @@ class _FusedOneshotLaunch(_PackedMath):
             col = col0
             while col < hidden_packs:
                 index = row_offset + Int64(col)
+                residual_index = Int64(row) * residual_row_stride_packs + Int64(col)
                 accumulator = cute.make_rmem_tensor(
                     (self._pack_elems,), cutlass.Float32
                 )
@@ -1044,12 +1053,16 @@ class _FusedOneshotLaunch(_PackedMath):
                     input_base,
                     residual_base,
                     index,
+                    residual_index,
                     total_packs,
                     shard_packs,
                     accumulator,
                 )
                 self._store_accumulator(
-                    residual_output_base + index * Int64(16), accumulator
+                    residual_output_base
+                    + (Int64(row) * residual_output_row_stride_packs + Int64(col))
+                    * Int64(16),
+                    accumulator,
                 )
                 for lane in cutlass.range_constexpr(self._pack_elems):
                     value = accumulator[lane]
@@ -1131,7 +1144,9 @@ class _FusedOneshotLaunch(_PackedMath):
                 scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
                 self._load_accumulate(
                     value,
-                    residual_output_base + index * Int64(16),
+                    residual_output_base
+                    + (Int64(row) * residual_output_row_stride_packs + Int64(col))
+                    * Int64(16),
                     True,
                 )
                 self._load_accumulate(scale, weight_base + Int64(col) * Int64(16), True)
@@ -1456,6 +1471,8 @@ def get_fused_oneshot_launcher(
         1,
         1,
         1,
+        1,
+        1,
         0.0,
         1,
         current_cuda_stream(),
@@ -1475,6 +1492,8 @@ def get_fused_oneshot_launcher(
         hidden_packs: int,
         rows: int,
         ctas_per_row: int,
+        residual_row_stride_packs: int,
+        residual_output_row_stride_packs: int,
         shard_packs: int,
         epsilon: float,
         grid_x: int,
@@ -1516,6 +1535,8 @@ def get_fused_oneshot_launcher(
             int(hidden_packs),
             int(rows),
             int(ctas_per_row),
+            int(residual_row_stride_packs),
+            int(residual_output_row_stride_packs),
             int(shard_packs),
             float(epsilon),
             int(grid_x),
