@@ -578,6 +578,30 @@ class B12XFP4ExpertWeights:
                     f"actual={actual_w2}, expected={expected_w2}"
                 )
 
+        from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+            mxfp4_prefill_min_tokens as _a4_min_tokens,
+            mxfp4_prefill_scale_format_supported as _a4_scale_ok,
+            validate_activation_globals as _a4_validate_globals,
+        )
+        if (
+            _a4_min_tokens() > 0
+            and not self.a1_gscale.is_meta
+            and _a4_scale_ok(self.plan.w4a16_scale_format)
+        ):
+            # W2 MXFP4 prefill: warm the unit-global admission verdict now,
+            # at weight prep, BEFORE CUDA-graph capture. Under capture with a
+            # cold cache the admission returns False and the graph bakes A16
+            # permanently (probe 2026-10-06: 95 binds/rank). validate is
+            # idempotent (fingerprint cache, cached verdict short-circuits the
+            # device sync) and capture-safe here. Gate-OFF / ineligible
+            # objects skip this entirely (no device work when disabled).
+            try:
+                _a4_validate_globals(self.a1_gscale, self.a2_gscale)
+            except Exception as exc:  # observable: never hide a warm failure
+                import sys as _sys
+                print(f"[a4warn] activation-globals warm failed: {exc!r}",
+                      file=_sys.stderr, flush=True)
+
         if (
             self.immutable_input_scales
             and "nvfp4" in self.plan.quant_modes
@@ -1093,6 +1117,7 @@ class TPMoEScratchPlan:
         topk_sum_launch = None
         route_pack_launches = None
         a4_prefill_launches = None
+        mxfp4_prefill_launches = None
         if (
             self.caps.quant_mode == "w4a16"
             and not self._core_workspace_plan.full_rotation
@@ -1125,6 +1150,47 @@ class TPMoEScratchPlan:
                         intermediate_cache2=tensors["intermediate_cache2"],
                     ):
                         a4_prefill_launches = None
+            # Default-OFF MXFP4 prefill (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS):
+            # admitted only for the packed e8m0_k32 payload with unit activation
+            # globals (validated once at bind, capture-safe).  Anything else
+            # falls through to today's W4A16 path unchanged.
+            select_mxfp4 = getattr(_w4a16_launches, "select_mxfp4", None)
+            if select_mxfp4 is not None:
+                candidate = select_mxfp4(
+                    tokens=int(a.shape[0]), route_ids_dtype=topk_ids.dtype,
+                    has_route_map=(route_expert_map is not None
+                                   or output_expert_map is not None),
+                    activation_amax=activation_amax,
+                    apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                    force=a4_prefill,
+                )
+                if candidate is not None:
+                    from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                        mxfp4_prefill_activation_globals_admitted,
+                        mxfp4_prefill_fits,
+                        mxfp4_prefill_supported,
+                    )
+
+                    prepared_layout = self.caps.w4a16_weight_layout or "packed"
+                    scale_format = self.caps.w4a16_scale_format or "e4m3_k16"
+                    if mxfp4_prefill_supported(
+                        prepared_layout=prepared_layout,
+                        scale_format=scale_format,
+                        activation=experts.activation,
+                        is_gated=experts.activation in {"silu"},
+                        dtype=a.dtype,
+                        hidden_size=int(a.shape[1]),
+                        intermediate_size=experts.intermediate_size,
+                        terms=candidate.terms,
+                        swiglu_limit=self.caps.swiglu_limit,
+                    ) and mxfp4_prefill_activation_globals_admitted(
+                        experts.a1_gscale, experts.a2_gscale,
+                    ) and mxfp4_prefill_fits(
+                        candidate, tokens=int(a.shape[0]),
+                        intermediate_cache13=tensors["intermediate_cache13"],
+                        intermediate_cache2=tensors["intermediate_cache2"],
+                    ):
+                        mxfp4_prefill_launches = candidate
         elif self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation:
             route_pack_launches = self._prewarmed_route_pack_launches
             tokens = int(a.shape[0])
@@ -1187,6 +1253,7 @@ class TPMoEScratchPlan:
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
+            mxfp4_prefill_launches=mxfp4_prefill_launches,
         )
         return replace(binding, scales_expanded=True) if scales_expanded else binding
 
@@ -1286,6 +1353,9 @@ class TPMoEFP4Binding:
     # Opt-in NVFP4-activation prefill over the W4A16 packed weights (selected at
     # bind for calls at or above its token threshold).
     a4_prefill_launches: object | None = None
+    # Default-OFF MXFP4-activation prefill over the packed e8m0_k32 weights
+    # (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS; selected at bind, prefill only).
+    mxfp4_prefill_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
     mixed_trellis_binding: object | None = None
@@ -2996,6 +3066,7 @@ def _build_tp_moe_fp4_binding_from_views(
     topk_sum_launch: object | None = None,
     route_pack_launches: object | None = None,
     a4_prefill_launches: object | None = None,
+    mxfp4_prefill_launches: object | None = None,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -3199,6 +3270,7 @@ def _build_tp_moe_fp4_binding_from_views(
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
+            mxfp4_prefill_launches=mxfp4_prefill_launches,
         )
 
     if plan.implementation == "micro":
@@ -3671,6 +3743,63 @@ def _plan_core_workspace(
                     ),
                 )
         intermediate_cache2_elements = routed_capacity * int(n)
+        # W2 MXFP4-A4 prefill workspace (Codex A2): the A4 pipeline carves
+        # quantization planes + route metadata out of cache2 and needs the
+        # per-route FC2 rows in cache13. Reserve the max of the A16 and A4
+        # requirements at plan time so mxfp4_prefill_fits cannot fail on
+        # scratch shortage at supported chunk sizes (2048/4096-token capacity).
+        # R2-fix (2026-10-06): reserve cache2 for the MXFP4-A4 prefill carve
+        # when the gate compiles it. Arithmetic replicates the kernel's
+        # _carve_layout EXACTLY (verified vs the compiled launches' own
+        # scratch_bytes at 512/1024/2048/4071/4096 live tokens, 2026-10-06:
+        # 19,091,712 @4071 matched to the byte). An earlier hand-rolled
+        # estimate ran 82KB short at capacity and all 69 layers' fits()
+        # rejected (probe: have 19,009,792 < need 19,091,712).
+        try:
+            _gate = int(os.environ.get("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "0") or 0)
+        except Exception:
+            _gate = 0
+        try:
+            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                mxfp4_prefill_terms as _a4_terms_fn,
+            )
+            _a4_terms = int(_a4_terms_fn())
+        except Exception:
+            _a4_terms = 1
+        _a4_off = 0
+        _a4_routes = 0
+        if _gate > 0 and token_capacity >= _gate:
+            from b12x.moe._shared.kernels.w4a16.host import (
+                route_pack_token_capacity as _rptc,
+                max_packed_route_slots as _mprs,
+            )
+            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                MXFP4_PREFILL_ROUTE_BLOCK as _RB,
+            )
+            _a4_t = int(token_capacity)
+            _a4_routes = _a4_t * int(num_topk)
+            _a4_numel_cap = _rptc(_a4_t, int(num_topk)) * int(num_topk)
+            _a4_pr = max(_mprs(_a4_numel_cap, _RB, int(route_E)), 1)
+            _a4_rbl = (_a4_pr + _RB - 1) // _RB
+            _a4_sizes = (
+                _a4_terms * _a4_t * int(k) // 2,
+                _a4_terms * _a4_t * (int(k) // 64) * 4,
+                _a4_terms * _a4_routes * int(n) // 2,
+                _a4_terms * _a4_routes * (int(n) // 64) * 4,
+                _a4_pr * 4,
+                _a4_rbl * 4,
+                4,
+                (int(route_E) + 1) * 4,
+                int(route_E) * 4,
+            )
+            _a4_off = 0
+            for _s in _a4_sizes:
+                _a4_off = (_a4_off + _s + 255) // 256 * 256
+            _a4_ebytes = torch.empty(0, dtype=dtype).element_size()
+            intermediate_cache2_elements = max(
+                intermediate_cache2_elements,
+                (_a4_off + _a4_ebytes - 1) // _a4_ebytes,
+            )
         direct_m = routed_capacity // max(int(num_topk), 1)
         if (
             not full_rotation
@@ -3718,6 +3847,15 @@ def _plan_core_workspace(
             if use_prefill_fused_sum
             else routed_capacity * max(fc1_cols, int(k))
         )
+        # W2 MXFP4-A4 prefill workspace (Codex A2): A4 stores one BF16 FC2 row
+        # per ROUTE (tokens*topk*H), far larger than the A16 fused-sum plan at
+        # 2048/4096-token capacity. Reserve the max (only when the A4 gate
+        # sized a carve above; _a4_routes is 0 otherwise).
+        if _a4_routes > 0:
+            intermediate_cache13_elements = max(
+                intermediate_cache13_elements,
+                _a4_routes * int(k),
+            )
         tensor_specs = [
             _TensorAllocSpec(
                 "intermediate_cache13",
@@ -13259,9 +13397,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     if experts.mxfp4_csf is not None and csf_inline is None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
     # The A4 prefill path (when present) reads expanded (W4A16-layout) scales.
+    # The MXFP4 prefill path reads the packed e8m0_k32 grids directly and also
+    # skips the stage-scale staging of the W4A16 fused launch.
     stage_scales = (
         experts.w4a16_expanded is not None
         and getattr(binding, "a4_prefill_launches", None) is None
+        and getattr(binding, "mxfp4_prefill_launches", None) is None
         and _w4a16_reads_stage_scales(binding, topk_ids.shape[0])
     )
     csf_reset_barriers = (
@@ -13561,6 +13702,30 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 intermediate_cache13=intermediate_cache13,
                 intermediate_cache2=intermediate_cache2,
                 output=scatter_output, launches=a4_launches,
+            )
+        mxfp4_launches = getattr(binding, "mxfp4_prefill_launches", None)
+        if mxfp4_launches is not None:
+            # Default-OFF MXFP4 prefill.  Bind admitted this call (env threshold,
+            # packed e8m0_k32 layout, unit activation globals, scratch fit,
+            # plain routing).  Prefill-only: the threshold gate keeps decode-size
+            # calls on the W4A16 path.
+            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                run_w4a16_mxfp4_prefill,
+            )
+
+            if os.environ.get("B12X_W4A16_MXFP4_PREFILL_TRACE", "") == "1":
+                logger.info(
+                    "B12X MXFP4 prefill dispatch: layer=%s tokens=%d topk=%d "
+                    "hidden=%d terms=%d",
+                    layer_idx, int(a.shape[0]), int(topk_ids.shape[1]),
+                    int(a.shape[1]), int(mxfp4_launches.terms),
+                )
+            return run_w4a16_mxfp4_prefill(
+                a, prepared, topk_weights, topk_ids,
+                a1_gscale=a1_gscale, a2_gscale=a2_gscale,
+                intermediate_cache13=intermediate_cache13,
+                intermediate_cache2=intermediate_cache2,
+                output=scatter_output, launches=mxfp4_launches,
             )
         result = run_w4a16_moe(
             a,
