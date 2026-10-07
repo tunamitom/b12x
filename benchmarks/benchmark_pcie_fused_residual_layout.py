@@ -45,6 +45,7 @@ from cuda.bindings import runtime as cudart
 
 import b12x
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.comm.pcie._oneshot_preparation import (
     _prepare_fused_call, plan as oneshot_plan, query_from_runtime,
 )
@@ -250,12 +251,15 @@ def _capture_case(
                 ),
             )
             session = PreparationSession(device=channel.device, autotune=False)
-            session.prepare(
-                (request,),
-                coordinator=lambda progress: (
-                    collective.key if progress.ready_collectives else None
-                ),
-            )
+            # Stream-affine channel: preparation must run on the channel's
+            # stream, matching capture (the pre-migration API primed there).
+            with torch.cuda.stream(streams[name]):
+                session.prepare(
+                    (request,),
+                    coordinator=lambda progress: (
+                        collective.key if progress.ready_collectives else None
+                    ),
+                )
             sessions[name] = session
             with torch.cuda.graph(graph, stream=streams[name]):
                 if name == "boundary_copy":
@@ -365,6 +369,7 @@ def _capture_case(
         "boundary_padding": boundary_padding,
         "reset": reset,
         "replay": replay,
+        "sessions": sessions,
         "validated_outputs": validated_outputs,
         "validated_residuals": validated_residuals,
     }
@@ -488,8 +493,7 @@ def _worker(
             # on the row count, so every case compiles during its capture;
             # resolution is frozen only around the timed replays, which
             # must not compile.
-            b12x.freeze_kernel_resolution("fused residual layout benchmark")
-            try:
+            with kernel_resolution_guard("fused residual layout benchmark"):
                 raw = _measure(
                     graphs,
                     metadata["streams"],
@@ -499,8 +503,6 @@ def _worker(
                     warmups,
                     metadata["reset"],
                 )
-            finally:
-                b12x.unfreeze_kernel_resolution()
             # Repeated-replay state: from the restored inputs every arm must
             # reproduce its validated outputs bitwise after the timed replays.
             metadata["reset"]()

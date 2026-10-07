@@ -232,7 +232,12 @@ def _prepare_fused_executions(channel, calls, epsilon, *, prefix):
     session.prepare(
         tuple(requests),
         coordinator=lambda progress: next(
-            (n for n in names if n in progress.ready_collectives), None
+            (
+                requirement.key
+                for requirement in progress.ready_collectives
+                if requirement.key in names
+            ),
+            None,
         ),
     )
     return session, plans
@@ -469,9 +474,12 @@ def _run_tp8_graph_mode_transition(
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with pool.capture(stream=stream, channel_id=channel_id):
-        session, plans = _prepare_fused_executions(
-            channel, calls, epsilon, prefix=channel_id,
-        )
+        # Preparation binds the stream-affine channel: run it on the channel's
+        # stream, matching capture (the pre-migration API primed on this stream).
+        with torch.cuda.stream(stream):
+            session, plans = _prepare_fused_executions(
+                channel, calls, epsilon, prefix=channel_id,
+            )
         with torch.cuda.graph(graph, stream=stream):
             for (inp, residual, weight, out), plan in zip(calls, plans, strict=True):
                 pool.all_reduce_fused_add_rms_norm(
@@ -567,12 +575,20 @@ def _run_tp8_split_view_graph(
                 )
             )
         session = PreparationSession(device=channel.device, autotune=False)
-        session.prepare(
-            tuple(requests),
-            coordinator=lambda progress: next(
-                (n for n in names if n in progress.ready_collectives), None
-            ),
-        )
+        # Stream-affine channel: preparation must run on the channel's stream,
+        # matching capture (the pre-migration API primed on this stream).
+        with torch.cuda.stream(stream):
+            session.prepare(
+                tuple(requests),
+                coordinator=lambda progress: next(
+                    (
+                        requirement.key
+                        for requirement in progress.ready_collectives
+                        if requirement.key in names
+                    ),
+                    None,
+                ),
+            )
         with torch.cuda.graph(graph, stream=stream):
             for (inp, residual, weight, _padding, out), plan in zip(
                 calls, plans, strict=True
@@ -727,15 +743,18 @@ def _run_pdl_dependent(
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
             with pool.capture(stream=stream, channel_id=graph_channel):
-                if name == "plain":
-                    session_g, _result_g, graph_plan = _prepare_plain_execution(
-                        channel, inp, plain_out, name=f"{graph_channel}:plain",
-                    )
-                else:
-                    session_g, _result_g, graph_plan, _out_g = _prepare_fused_execution(
-                        channel, inp, residual, weight, epsilon,
-                        name=f"{graph_channel}:fused",
-                    )
+                # Stream-affine channel: prepare on the channel's stream,
+                # matching capture (the pre-migration API primed on this stream).
+                with torch.cuda.stream(stream):
+                    if name == "plain":
+                        session_g, _result_g, graph_plan = _prepare_plain_execution(
+                            channel, inp, plain_out, name=f"{graph_channel}:plain",
+                        )
+                    else:
+                        session_g, _result_g, graph_plan, _out_g = _prepare_fused_execution(
+                            channel, inp, residual, weight, epsilon,
+                            name=f"{graph_channel}:fused",
+                        )
                 with torch.cuda.graph(graph, stream=stream):
                     allreduce(graph_channel, stream, plan=graph_plan)
                     copy(produced, dependent_out, use_pdl)

@@ -3070,11 +3070,18 @@ class PCIeOneshotAllReduce:
         launcher, state = self._prepared_launcher(launchers, inp)
         call = query.call
         table_address, _ = self._ext._select_table(state, inp.data_ptr())
+        residual_row_stride_packs = _fused_row_stride_packs(residual)
+        residual_output_row_stride_packs = _fused_row_stride_packs(residual_out)
+        if residual_row_stride_packs is None or residual_output_row_stride_packs is None:
+            raise ValueError(
+                "fused allreduce RMSNorm residual rows must be pack-aligned contiguous"
+            )
         with torch.cuda.device(inp.device):
             launcher(
                 table_address, state.signal_table_address, inp.data_ptr(), residual.data_ptr(),
                 weight.data_ptr(), out.data_ptr(), residual_out.data_ptr(),
                 call["hidden_packs"], call["rows"], call["ctas_per_row"],
+                residual_row_stride_packs, residual_output_row_stride_packs,
                 int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 float(epsilon), call["blocks"],
             )
