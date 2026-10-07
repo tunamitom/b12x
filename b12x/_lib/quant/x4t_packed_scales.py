@@ -23,6 +23,28 @@ from b12x._lib.quant.x4t_scales import X4TScaleBatch
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
+# Completed packed X4T scale decode launches (one grid per decode call, paired
+# or single). Tests assert on this record to prove that a consumed scale
+# prefetch removed the corresponding inline decode launch; nothing on the
+# serving path reads it. Plain integer state, GIL-serialized.
+_packed_scale_launches = 0
+
+
+def packed_scale_launch_count() -> int:
+    """Number of ``decode_x4t_packed_scale(_pair)`` launches issued so far."""
+    return _packed_scale_launches
+
+
+def reset_packed_scale_launch_count() -> None:
+    """Test hook: zero the launch record (never called on the serving path)."""
+    global _packed_scale_launches
+    _packed_scale_launches = 0
+
+
+def _record_packed_scale_launch() -> None:
+    global _packed_scale_launches
+    _packed_scale_launches += 1
+
 
 class _PackedScaleDecode:
     def __init__(
@@ -505,6 +527,7 @@ def decode_x4t_packed_scales(
             expert_ids_sorted,
         )
     )
+    _record_packed_scale_launch()
     compiled(
         make_ptr(
             cutlass.Uint8,
@@ -610,6 +633,7 @@ def decode_x4t_packed_scale_pair(
                 )
             )
     ids64 = expert_ids.dtype == torch.int64
+    _record_packed_scale_launch()
     compiled(
         *pointers,
         make_ptr(

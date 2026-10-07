@@ -430,6 +430,56 @@ class _PreparedWeightRepresentation:
 
 
 @dataclass(frozen=True, kw_only=True)
+class X4TPrefetchCapability:
+    """Retained all-expert X4T scale expansion for one prepared W4A16 payload.
+
+    Built at preparation time (``prepare_b12x_x4t_weights``): the paired X4T
+    planes, the retained paired programs and the packed ``w13_scale``/
+    ``w2_scale`` scratch destinations the inline decode would write, plus the
+    persistent selector buffers the expansion needs.  ``expand_scales`` uses
+    this to expand EVERY expert into the shared scratch ahead of the call;
+    a matching ``bind(..., x4t_scales_expanded=True)`` then makes the X4T
+    runners skip their inline decode launch (see that flag's contract).
+
+    Selector legality (both arms proven byte-equal to the selective decode):
+    the preferred arm is ``counts`` — an all-ones int32 buffer of E entries
+    with ``expert_counts=True`` and the retained counts program at index 1 of
+    ``programs``.  Counts must be POSITIVE: zero counts select no experts, and
+    zero IDs in ordinary IDs mode select only expert 0.  The alternative arm
+    is ``all_expert_ids`` — a persistent int32 ``arange(E)`` with the retained
+    ordinary-IDs program at index 0 and its default flags (never set
+    ``expert_ids_unique=True`` for a program compiled for ``unique=False``).
+
+    Destinations are NOT stored here: ``expand_scales`` writes the expert
+    package's canonical ``w1_blockscale``/``w2_blockscale`` handles (the shared
+    scratch views), so a storage-reusing weight reload cannot leave this
+    capability pointing at replaced tensors.
+    """
+
+    planes: tuple
+    programs: tuple
+    counts: torch.Tensor
+    all_expert_ids: torch.Tensor
+
+
+def _x4t_prefetch_capability(value: Any) -> X4TPrefetchCapability | None:
+    """The all-expert expansion capability of a prepared X4T payload, if any."""
+    programs = getattr(value, "x4t_packed_pair_programs", None)
+    first = getattr(value, "x4t_w13_scale", None)
+    second = getattr(value, "x4t_w2_scale", None)
+    if programs is None or first is None or second is None:
+        return None
+    device = value.w13_scale.device
+    experts = int(first.num_experts)
+    return X4TPrefetchCapability(
+        planes=(first, second),
+        programs=programs,
+        counts=torch.ones(experts, dtype=torch.int32, device=device),
+        all_expert_ids=torch.arange(experts, dtype=torch.int32, device=device),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class B12XFP4ExpertWeights:
     """The sole owner and complete runtime contract for FP4 MoE experts.
 
@@ -455,6 +505,10 @@ class B12XFP4ExpertWeights:
     # planned above the stage-scale token limit (nvfp4_csf expands into it).
     w4a16_expanded: object | None = None
     mxfp4_csf: object | None = None
+    # Retained all-expert X4T scale expansion for the paired-program payload
+    # (X4TPrefetchCapability).  Built at preparation; None for every payload
+    # without paired X4T planes/programs (including all NVFP4 and A8 owners).
+    x4t_prefetch: object | None = None
     # Compact W4A8 experts prepared from MXFP4-CSF checkpoints whose kernels read
     # compressed scales inline: (w13, w2) Mxfp4CsfInlinePlane. The canonical scale
     # fields keep the caller's expansion scratch, which these launches never read.
@@ -1033,6 +1087,7 @@ class TPMoEScratchPlan:
         output_expert_map: torch.Tensor | None = None,
         a4_prefill: bool | None = None,
         scales_expanded: bool = False,
+        x4t_scales_expanded: bool = False,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
         """Bind live tensors to this scratch plan.
@@ -1045,9 +1100,31 @@ class TPMoEScratchPlan:
         ``scales_expanded`` states that ``expand_scales(experts)`` ran on this
         call's stream (or one it waits for) after the last other use of the
         shared NVFP4-CSF scratch; the call then skips its own expansion.
+
+        ``x4t_scales_expanded`` is the X4T twin of ``scales_expanded``: it
+        states that the prepared payload's X4T scale planes were expanded into
+        the shared packed ``w13_scale``/``w2_scale`` scratch (every expert, e.g.
+        via ``expand_scales``) after the last other reader of that scratch and
+        before this call, on this call's stream or one it waits for.  The X4T
+        runners then skip their inline ``decode_x4t_packed_scale_pair`` launch.
+        Declare it only for a call whose route ABI is covered by the prefetch
+        (a full-expansion prefetch covers every route ABI); the flag is
+        per-call and never persists.
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+        if x4t_scales_expanded and (
+            self.caps.quant_mode != "w4a16" or experts.x4t_prefetch is None
+        ):
+            # Reject rather than silently assume the consumer will skip: only
+            # the W4A16 X4T runners consult the flag, and only a payload with a
+            # retained all-expert expansion (paired programs) can have been
+            # prefetched. Every other path (A8 MXFP4, NVFP4, inline, tp12-only
+            # X4T) must run its own expansion.
+            raise ValueError(
+                "x4t_scales_expanded requires a W4A16 plan whose experts "
+                "retain the paired-program X4T expansion capability"
+            )
         weight_plan = experts.plan
         if (
             weight_plan.w4a16_compressed_scales
@@ -1255,6 +1332,7 @@ class TPMoEScratchPlan:
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
             mxfp4_prefill_launches=mxfp4_prefill_launches,
+            x4t_scales_expanded=bool(x4t_scales_expanded),
         )
         return replace(binding, scales_expanded=True) if scales_expanded else binding
 
@@ -1359,6 +1437,12 @@ class TPMoEFP4Binding:
     mxfp4_prefill_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
+    # The caller expanded every expert's X4T scale planes into this payload's
+    # packed w13_scale/w2_scale scratch after the scratch's last reader and
+    # before this call (e.g. via expand_scales on a side stream this call waits
+    # for). The W4A16 X4T runners then skip their inline
+    # decode_x4t_packed_scale_pair launch. Per-call; never persists.
+    x4t_scales_expanded: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
 
@@ -3068,9 +3152,18 @@ def _build_tp_moe_fp4_binding_from_views(
     route_pack_launches: object | None = None,
     a4_prefill_launches: object | None = None,
     mxfp4_prefill_launches: object | None = None,
+    x4t_scales_expanded: bool = False,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+    if x4t_scales_expanded and plan.implementation != "w4a16":
+        # Only the W4A16 runners consult the X4T scale-prefetch readiness flag.
+        # Reject every unsupported implementation (micro/dynamic/mixed) rather
+        # than silently assuming its consumer will skip its own expansion.
+        raise ValueError(
+            "x4t_scales_expanded is only supported for W4A16 bindings; got "
+            f"implementation={plan.implementation!r}"
+        )
     if a.ndim != 2:
         raise ValueError(
             f"expected input activations with rank 2, got {tuple(a.shape)}"
@@ -3272,6 +3365,7 @@ def _build_tp_moe_fp4_binding_from_views(
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
             mxfp4_prefill_launches=mxfp4_prefill_launches,
+            x4t_scales_expanded=x4t_scales_expanded,
         )
 
     if plan.implementation == "micro":
@@ -7248,6 +7342,11 @@ def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
             layout=PreparedWeightLayout.SOURCE_NATIVE if native else PreparedWeightLayout.MMA_PACKED,
             value=value,
         ),
+        # All-expert X4T scale prefetch: paired programs retain the counts
+        # (index 1) and ordinary-IDs (index 0) route ABIs; the capability keeps
+        # the persistent selector buffers alongside the packed scale
+        # destinations the inline decode would write.
+        x4t_prefetch=_x4t_prefetch_capability(value),
     )
 
 
@@ -13729,6 +13828,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 intermediate_cache13=intermediate_cache13,
                 intermediate_cache2=intermediate_cache2,
                 output=scatter_output, launches=mxfp4_launches,
+                x4t_scales_expanded=binding.x4t_scales_expanded,
             )
         result = run_w4a16_moe(
             a,
@@ -13782,6 +13882,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 if binding.route_pack_launches is not None
                 else plan.decode_config.w4a16_route_mode or "auto"
             ),
+            x4t_scales_expanded=binding.x4t_scales_expanded,
         )
         return _finalize_trellis_output(binding, result)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)

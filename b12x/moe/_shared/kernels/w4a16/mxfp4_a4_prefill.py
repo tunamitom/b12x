@@ -1259,7 +1259,8 @@ def run_w4a16_mxfp4_prefill(a: torch.Tensor, prepared, topk_weights: torch.Tenso
                             intermediate_cache13: torch.Tensor,
                             intermediate_cache2: torch.Tensor,
                             output: torch.Tensor,
-                            launches: W4A16Mxfp4PrefillLaunches) -> torch.Tensor:
+                            launches: W4A16Mxfp4PrefillLaunches,
+                            x4t_scales_expanded: bool = False) -> torch.Tensor:
     """Route pack (128) -> MXFP4 quant -> FC1 -> FC2 -> FP32-weighted top-k sum.
 
     Every buffer is a view of caller scratch: ``intermediate_cache2`` holds the
@@ -1333,7 +1334,11 @@ def run_w4a16_mxfp4_prefill(a: torch.Tensor, prepared, topk_weights: torch.Tenso
     # already admitted pre-launch (``_admit_x4t_payload``): planes require
     # paired programs, so the decode below runs only for well-formed paired
     # X4T; unpaired X4T was rejected before any launch.
-    if x4t_programs is not None:
+    # Skipped when the caller pre-expanded every expert's scales into this
+    # payload's scale scratch (x4t_scales_expanded=True): the all-expert
+    # expansion is a superset of this selective decode for both route arms
+    # (counts and sorted blocks), so the inline launch would be duplicate work.
+    if x4t_programs is not None and not x4t_scales_expanded:
         # kernel.py:13804-13833 with use_direct_topk_routes=False: start
         # from the caller-owned expert counts, or bound the sorted
         # block_expert_ids list (retained paired programs, indices 1/3).
