@@ -40,6 +40,10 @@ test_x4t_prefetch_consumer_skip.py.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -63,6 +67,73 @@ H, N, E, TOPK = 3584, 256, 4, 2
 
 W13_ROWS, W13_COLS = 2 * N, H // 32  # FC1 scale grid (rows, K/32 columns)
 W2_ROWS, W2_COLS = H, N // 32  # FC2 scale grid
+
+# Isolated child program for the tightened negative arm (Codex §10.1): a
+# real pending side-stream prefetch, then wait_event(pending) INSIDE
+# torch.cuda.graph capture. Empirical contract (pinned on this build,
+# CUDA 12.x / torch 2.14): the wait raises torch.AcceleratorError with the
+# CUDA root error cudaErrorStreamCaptureIsolation ("dependency created on
+# uncaptured work in another stream") and the subsequent capture_end fails
+# with cudaErrorStreamCaptureInvalidated. The child prints the observed
+# class + both CUDA error names and exits 0 so the parent can assert on the
+# EXACT error contract; it is a subprocess because the invalidated capture
+# poisons this process's capture machinery for later captures.
+_NEGATIVE_ARM_SUBPROCESS = """
+import sys
+
+sys.path.insert(0, {root!r})
+
+import torch
+
+from tests.moe import test_x4t_prefetch_public_path as T
+
+T.require_b12x()
+
+scratch_pair = T._scratch()
+experts = T._prepare(scratch_pair, native=True, scale_seed=7000)
+tokens = 8
+plan = T._public_plan(experts, tokens)
+
+def body(states):
+    scratch = T._state_scratch(states["main"])
+    a, ids, weights = T._activations(tokens)
+    main = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    moe_bad = torch.cuda.Event()
+    pending = torch.cuda.Event()
+    reader = torch.empty_like(a)
+    T._bind_run(plan, scratch, a=a, ids=ids, weights=weights,
+                output=reader, expanded=False)
+    moe_bad.record(main)
+    with torch.cuda.stream(side):
+        side.wait_event(moe_bad)
+        assert T.fused_moe.expand_scales(experts) is True
+        pending.record(side)  # still pending: never waited, never synced
+    graph_bad = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph_bad):
+            torch.cuda.current_stream().wait_event(pending)
+        print("NEGATIVE_ARM_RESULT=no-exception")
+    except Exception as exc:
+        import traceback
+
+        cls = type(exc).__name__
+        chain = [exc]
+        while chain[-1].__cause__ is not None:
+            chain.append(chain[-1].__cause__)
+        text = "\\n".join(str(e) for e in chain)
+        text += "\\n" + traceback.format_exc()
+        print(f"NEGATIVE_ARM_RESULT={{cls}}")
+        print("NEGATIVE_ARM_TEXT_START")
+        print(text)
+        print("NEGATIVE_ARM_TEXT_END")
+    torch.cuda.synchronize()
+    del graph_bad
+
+T._in_session({{"main": plan}}, body, tokens=tokens)
+""".format(
+    root=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 
 @pytest.fixture(autouse=True)
@@ -571,23 +642,42 @@ def test_capture_and_replay_transition_with_pending_prefetch():
         # an invalidated capture leaves the context's capture machinery in a
         # failed state for that graph only; the successful graph above is
         # already instantiated and unaffected.
-        main = torch.cuda.current_stream()
-        side = torch.cuda.Stream()
-        moe_bad = torch.cuda.Event()
-        pending = torch.cuda.Event()
-        reader = torch.empty_like(out_ref)
-        _bind_run(plan, scratch, a=a, ids=ids, weights=weights, output=reader, expanded=False)
-        moe_bad.record(main)
-        with torch.cuda.stream(side):
-            side.wait_event(moe_bad)
-            assert fused_moe.expand_scales(experts) is True
-            pending.record(side)  # still pending: never waited, never synced
-        graph_bad = torch.cuda.CUDAGraph()
-        with pytest.raises(Exception):
-            with torch.cuda.graph(graph_bad):
-                torch.cuda.current_stream().wait_event(pending)
-        torch.cuda.synchronize()
-        del graph_bad
+        # Codex §10.1: tightened from pytest.raises(Exception) to the ACTUAL
+        # CUDA capture error class/message (torch.AcceleratorError with
+        # cudaErrorStreamCaptureIsolation / cudaErrorStreamCaptureInvalidated
+        # -- pinned empirically on this build; an arbitrary exception is not
+        # proof of the documented CUDA error class). Because an invalidated
+        # capture can poison subsequent captures IN THIS PROCESS, the
+        # wait-inside-capture runs in an ISOLATED SUBPROCESS: the parent
+        # asserts on the child's exit status and stderr.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _NEGATIVE_ARM_SUBPROCESS,
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS": "1"},
+            timeout=600,
+        )
+        assert proc.returncode == 0, (
+            "the isolated wait-inside-capture child must report the intended "
+            f"CUDA capture error; got rc={proc.returncode} "
+            f"stdout={proc.stdout[-500:]} stderr={proc.stderr[-2000:]}"
+        )
+        assert "NEGATIVE_ARM_RESULT=AcceleratorError" in proc.stdout, (
+            f"the child must surface torch.AcceleratorError; stdout="
+            f"{proc.stdout[-500:]}"
+        )
+        assert "cudaErrorStreamCaptureIsolation" in proc.stdout, (
+            "the root error must be the CUDA capture-isolation error "
+            f"(dependency on uncaptured work); stdout={proc.stdout[-2000:]}"
+        )
+        assert "cudaErrorStreamCaptureInvalidated" in proc.stdout, (
+            "capture_end must fail with the CUDA capture-invalidated error; "
+            f"stdout={proc.stdout[-2000:]}"
+        )
 
     _in_session({"main": plan}, body, tokens=tokens)
 
