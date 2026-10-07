@@ -33,8 +33,8 @@ import torch
 
 from b12x._lib.quant.x4t_packed_scales import (
     decode_x4t_packed_scale_pair,
-    packed_scale_launch_count,
-    reset_packed_scale_launch_count,
+    packed_scale_host_call_count,
+    reset_packed_scale_host_call_count,
 )
 from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
 from b12x.moe import fused_moe
@@ -46,6 +46,21 @@ H, N, E, TOPK = 3584, 256, 4, 2
 W13_ROWS, W13_COLS = 2 * N, H // 32
 W2_ROWS, W2_COLS = H, N // 32
 W13_ROTATION = N  # w13_layout="w13" rotates the fused FC1 halves
+
+
+@pytest.fixture(autouse=True)
+def _launch_diagnostics(monkeypatch):
+    """Enable the (env-gated, host-call) packed-scale diagnostics for every
+    test in this module, and zero the record before/after each test.
+
+    The record is HOST-CALL instrumentation (increments when the host issues
+    the decode, including under capture; replays do not increment) -- the
+    tests here assert on host-call issuance/removal, never GPU completions.
+    """
+    monkeypatch.setenv("B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS", "1")
+    reset_packed_scale_host_call_count()
+    yield
+    reset_packed_scale_host_call_count()
 
 
 def _planes(rows, columns, rotation, *, seed):
@@ -174,20 +189,19 @@ def test_x4t_prefetch_expansion_matches_selective_decode_for_active_experts():
     assert capability.counts.dtype == torch.int32
     assert capability.counts.numel() == E
     assert bool((capability.counts > 0).all())
-    # Alternative selector: persistent int32 arange(E).
-    assert torch.equal(
-        capability.all_expert_ids, torch.arange(E, dtype=torch.int32, device="cuda")
-    )
+    # The unused ordinary-IDs alternative (arange(E)) is deliberately NOT
+    # allocated in the counts-only serving implementation (Codex review:
+    # gate-OFF preparation cost must be near zero).
+    assert not hasattr(capability, "all_expert_ids")
 
     planes = capability.planes
-    reset_packed_scale_launch_count()
-    before = packed_scale_launch_count()
+    reset_packed_scale_host_call_count()
+    before = packed_scale_host_call_count()
     assert fused_moe.expand_scales(experts) is True
     torch.cuda.synchronize()
-    assert packed_scale_launch_count() == before + 1, (
+    assert packed_scale_host_call_count() == before + 1, (
         "expand_scales must issue exactly one paired X4T decode launch"
     )
-
     sparse = torch.tensor([2], dtype=torch.int32, device="cuda")
     reference = _selective_reference(planes, sparse)
     _assert_active_match(scratch, reference, active={2})
@@ -289,12 +303,12 @@ def test_consumed_prefetch_removes_inline_a4_decode_launch():
             x4t_scales_expanded=flag,
         )
 
-    reset_packed_scale_launch_count()
+    reset_packed_scale_host_call_count()
     # Inline path: the runner expands the routed experts itself.
-    before = packed_scale_launch_count()
+    before = packed_scale_host_call_count()
     first = run(False).clone()
     torch.cuda.synchronize()
-    assert packed_scale_launch_count() - before == 1, (
+    assert packed_scale_host_call_count() - before == 1, (
         "the inline A4 arm must issue its X4T decode launch"
     )
 
@@ -303,10 +317,10 @@ def test_consumed_prefetch_removes_inline_a4_decode_launch():
         buf.fill_(0xD6)
     assert fused_moe.expand_scales(experts) is True
     torch.cuda.synchronize()
-    before = packed_scale_launch_count()
+    before = packed_scale_host_call_count()
     second = run(True).clone()
     torch.cuda.synchronize()
-    consumed = packed_scale_launch_count() - before
+    consumed = packed_scale_host_call_count() - before
     assert consumed == 0, (
         f"a consumed prefetch must REMOVE the inline decode launch, got "
         f"{consumed} launches"
@@ -315,10 +329,10 @@ def test_consumed_prefetch_removes_inline_a4_decode_launch():
     assert torch.equal(first, second)
 
     # Unset flag on the next call: the inline decode is back (no leakage).
-    before = packed_scale_launch_count()
+    before = packed_scale_host_call_count()
     run(False)
     torch.cuda.synchronize()
-    assert packed_scale_launch_count() - before == 1, (
+    assert packed_scale_host_call_count() - before == 1, (
         "the skip flag must be per-call, not sticky"
     )
 
@@ -381,11 +395,11 @@ def test_consumed_prefetch_removes_inline_a16_packed_decode_launch():
             x4t_scales_expanded=flag,
         )
 
-    reset_packed_scale_launch_count()
-    before = packed_scale_launch_count()
+    reset_packed_scale_host_call_count()
+    before = packed_scale_host_call_count()
     first = run(False).clone()
     torch.cuda.synchronize()
-    assert packed_scale_launch_count() - before == 1, (
+    assert packed_scale_host_call_count() - before == 1, (
         "the inline A16 packed arm must issue its X4T decode launch"
     )
 
@@ -393,10 +407,10 @@ def test_consumed_prefetch_removes_inline_a16_packed_decode_launch():
         buf.fill_(0xD6)
     assert fused_moe.expand_scales(experts) is True
     torch.cuda.synchronize()
-    before = packed_scale_launch_count()
+    before = packed_scale_host_call_count()
     second = run(True).clone()
     torch.cuda.synchronize()
-    assert packed_scale_launch_count() - before == 0, (
+    assert packed_scale_host_call_count() - before == 0, (
         "a consumed prefetch must REMOVE the A16 inline decode launch"
     )
     assert torch.equal(first, second)
@@ -411,9 +425,12 @@ def test_skip_contract_shape():
         "bind must expose the X4T consumer-skip readiness flag"
     )
     fields = set(X4TPrefetchCapability.__dataclass_fields__)
-    assert {"planes", "programs", "counts", "all_expert_ids"} <= fields, (
-        f"capability must retain planes/programs/counts/all_expert_ids, got {fields}"
+    assert {"planes", "programs", "counts"} <= fields, (
+        f"capability must retain planes/programs/counts, got {fields}"
     )
+    # The counts-only serving implementation must not carry the unused
+    # ordinary-IDs alternative (Codex review: gate-OFF cost near zero).
+    assert "all_expert_ids" not in fields
     source = inspect.getsource(fused_moe.expand_scales)
     assert "expert_counts=True" in source, (
         "the prepared full-X4T expansion must use the counts-mode paired program"
@@ -431,8 +448,12 @@ def test_counts_legality_zero_selects_nothing():
     from b12x.moe.fused_moe._impl import _x4t_prefetch_capability
 
     source = inspect.getsource(_x4t_prefetch_capability)
-    assert "torch.ones" in source and "torch.arange" in source, (
-        "the capability must use all-ones counts and arange(E) IDs"
+    assert "torch.ones" in source, (
+        "the capability must use all-ones counts"
+    )
+    assert "torch.arange" not in source, (
+        "the counts-only serving implementation must not allocate the unused "
+        "arange(E) IDs alternative"
     )
     doc = mod.decode_x4t_packed_scales.__doc__
     assert "positive" in doc.lower(), "counts must be positive to select an expert"

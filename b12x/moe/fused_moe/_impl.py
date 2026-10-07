@@ -436,19 +436,24 @@ class X4TPrefetchCapability:
     Built at preparation time (``prepare_b12x_x4t_weights``): the paired X4T
     planes, the retained paired programs and the packed ``w13_scale``/
     ``w2_scale`` scratch destinations the inline decode would write, plus the
-    persistent selector buffers the expansion needs.  ``expand_scales`` uses
+    persistent selector buffer the expansion needs.  ``expand_scales`` uses
     this to expand EVERY expert into the shared scratch ahead of the call;
     a matching ``bind(..., x4t_scales_expanded=True)`` then makes the X4T
     runners skip their inline decode launch (see that flag's contract).
 
-    Selector legality (both arms proven byte-equal to the selective decode):
-    the preferred arm is ``counts`` — an all-ones int32 buffer of E entries
-    with ``expert_counts=True`` and the retained counts program at index 1 of
-    ``programs``.  Counts must be POSITIVE: zero counts select no experts, and
-    zero IDs in ordinary IDs mode select only expert 0.  The alternative arm
-    is ``all_expert_ids`` — a persistent int32 ``arange(E)`` with the retained
+    Selector legality (proven byte-equal to the selective decode): the
+    serving arm is ``counts`` -- an all-ones int32 buffer of E entries with
+    ``expert_counts=True`` and the retained counts program at index 1 of
+    ``programs``.  Counts must be POSITIVE: zero counts select no experts,
+    and zero IDs in ordinary IDs mode select only expert 0.  The documented
+    alternative arm -- a persistent int32 ``arange(E)`` with the retained
     ordinary-IDs program at index 0 and its default flags (never set
-    ``expert_ids_unique=True`` for a program compiled for ``unique=False``).
+    ``expert_ids_unique=True`` for a program compiled for ``unique=False``)
+    -- is intentionally NOT allocated: this serving implementation only ever
+    expands through counts mode, so allocating the unused IDs buffer for
+    every paired X4T payload (even with vLLM's prefetch gate OFF) would be
+    pure waste.  Re-add it at the call site if an IDs-mode arm is ever
+    needed (Codex review: gate-OFF preparation cost must be near zero).
 
     Destinations are NOT stored here: ``expand_scales`` writes the expert
     package's canonical ``w1_blockscale``/``w2_blockscale`` handles (the shared
@@ -459,7 +464,6 @@ class X4TPrefetchCapability:
     planes: tuple
     programs: tuple
     counts: torch.Tensor
-    all_expert_ids: torch.Tensor
 
 
 def _x4t_prefetch_capability(value: Any) -> X4TPrefetchCapability | None:
@@ -475,7 +479,6 @@ def _x4t_prefetch_capability(value: Any) -> X4TPrefetchCapability | None:
         planes=(first, second),
         programs=programs,
         counts=torch.ones(experts, dtype=torch.int32, device=device),
-        all_expert_ids=torch.arange(experts, dtype=torch.int32, device=device),
     )
 
 
