@@ -45,6 +45,10 @@ from cuda.bindings import runtime as cudart
 
 import b12x
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie._oneshot_preparation import (
+    _prepare_fused_call, plan as oneshot_plan, query_from_runtime,
+)
+from b12x.preparation import CollectiveRequirement, PreparationSession
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks.common import (  # noqa: E402
@@ -220,28 +224,53 @@ def _capture_case(
     streams = {name: torch.cuda.Stream(device=device) for name in ARMS}
     graphs: dict[str, torch.cuda.CUDAGraph] = {}
 
+    sessions = {}
     for name in ARMS:
         channel_id = f"graph:layout:{rows}:{name}"
         channel = pool.for_stream(streams[name], channel_id=channel_id)
-        with torch.cuda.stream(streams[name]):
-            channel.prepare_graph_fused_add_rms_norm(inputs[name])
         graph = torch.cuda.CUDAGraph(keep_graph=True)
-        with (
-            pool.capture(stream=streams[name], channel_id=channel_id),
-            torch.cuda.graph(graph, stream=streams[name]),
-        ):
-            if name == "boundary_copy":
-                boundary_residual.copy_(boundary_source)
-            pool.all_reduce_fused_add_rms_norm(
-                inputs[name],
-                residuals[name],
-                weight,
-                epsilon,
-                out=outputs[name],
-                residual_out=residuals[name],
-                stream=streams[name],
-                channel_id=channel_id,
+        with pool.capture(stream=streams[name], channel_id=channel_id):
+            query = query_from_runtime(
+                channel,
+                surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
+                call={"inp": inputs[name]},
             )
+            declaration = oneshot_plan(query, runtime=channel)
+            ranks = tuple(range(dist.get_world_size()))
+            collective = CollectiveRequirement(
+                key=f"layout:{rows}:{name}", ranks=ranks,
+            )
+            request = declaration.request(
+                name=f"layout:{rows}:{name}",
+                collective=collective,
+                prepare_call=lambda state, name=name: _prepare_fused_call(
+                    state, inp=inputs[name], residual=residuals[name],
+                    weight=weight, out=outputs[name],
+                    residual_out=residuals[name], epsilon=epsilon,
+                ),
+            )
+            session = PreparationSession(device=channel.device, autotune=False)
+            session.prepare(
+                (request,),
+                coordinator=lambda progress: (
+                    collective.key if progress.ready_collectives else None
+                ),
+            )
+            sessions[name] = session
+            with torch.cuda.graph(graph, stream=streams[name]):
+                if name == "boundary_copy":
+                    boundary_residual.copy_(boundary_source)
+                pool.all_reduce_fused_add_rms_norm(
+                    inputs[name],
+                    residuals[name],
+                    weight,
+                    epsilon,
+                    plan=declaration,
+                    out=outputs[name],
+                    residual_out=residuals[name],
+                    stream=streams[name],
+                    channel_id=channel_id,
+                )
         graphs[name] = graph
 
     expected_out, expected_residual_fp32 = _reference(
@@ -496,6 +525,9 @@ def _worker(
             }
             local_correctness.append(case["correctness"])
             local_validation.append(case["validation"])
+            for session in metadata["sessions"].values():
+                session.close()
+            del graphs
             if rank == 0:
                 case["raw_slowest_rank_us"] = raw
                 case["summary_slowest_rank_us"] = {

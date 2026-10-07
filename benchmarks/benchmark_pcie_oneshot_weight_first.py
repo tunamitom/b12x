@@ -207,11 +207,42 @@ def _worker(
             residual = torch.randn(shape, dtype=dtype, device=device)
             out = torch.empty_like(x_in)
             residual_out = torch.empty_like(x_in)
-            pool.prepare_graph_fused_add_rms_norm(x_in)
+            channel = pool.for_stream()
+            from b12x.comm.pcie._oneshot_preparation import (
+                _prepare_fused_call, plan as oneshot_plan, query_from_runtime,
+            )
+            from b12x.preparation import CollectiveRequirement, PreparationSession
+            query = query_from_runtime(
+                channel,
+                surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
+                call={"inp": x_in},
+            )
+            declaration = oneshot_plan(query, runtime=channel)
+            ranks = tuple(range(dist.get_world_size()))
+            collective = CollectiveRequirement(
+                key=f"wf-bench:{rows}", ranks=ranks,
+            )
+            request = declaration.request(
+                name=f"wf-bench:{rows}",
+                collective=collective,
+                prepare_call=lambda state: _prepare_fused_call(
+                    state, inp=x_in, residual=residual, weight=norm_w, out=out,
+                    residual_out=residual_out, epsilon=1e-6,
+                ),
+            )
+            session = PreparationSession(device=channel.device, autotune=False)
+            session.prepare(
+                (request,),
+                coordinator=lambda progress: (
+                    collective.key if progress.ready_collectives else None
+                ),
+            )
+            plan = declaration
 
             def allreduce():
                 pool.all_reduce_fused_add_rms_norm(
-                    x_in, residual, norm_w, 1e-6, out=out, residual_out=residual_out
+                    x_in, residual, norm_w, 1e-6, plan=plan, out=out,
+                    residual_out=residual_out,
                 )
 
             # (name, projection callable returning its outputs, its weights)
@@ -321,6 +352,7 @@ def _worker(
                         f"{by_name['wf-d1']['ratio_vs_cublas']:.3f} (acceptance: < 1)",
                         flush=True,
                     )
+            session.close()
         if rank == 0 and json_path:
             provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot(device)
             with open(json_path, "w", encoding="utf-8") as fh:

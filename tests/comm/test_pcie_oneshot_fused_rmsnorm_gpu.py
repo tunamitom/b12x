@@ -12,7 +12,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 from b12x.comm.pcie._oneshot_preparation import (
-    _prepare_fused_call, plan as oneshot_plan, query_from_runtime,
+    _prepare_fused_call, _prepare_plain_call, plan as oneshot_plan,
+    query_from_runtime,
 )
 from b12x.preparation import CollectiveRequirement, PreparationSession
 
@@ -197,6 +198,67 @@ def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
     )
     residual.copy_(original_residual)
     return session, result, declaration, out
+
+
+def _prepare_fused_executions(channel, calls, epsilon, *, prefix):
+    """Prepare one shape-locked fused plan per call on a single session."""
+    ranks = tuple(range(dist.get_world_size()))
+    names = []
+    requests = []
+    plans = []
+    for index, (inp, residual, weight, _out) in enumerate(calls):
+        out = torch.empty_like(inp)
+        calls[index] = (inp, residual, weight, out)
+        query = query_from_runtime(
+            channel, surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
+            call={"inp": inp},
+        )
+        declaration = oneshot_plan(query, runtime=channel)
+        name = f"{prefix}:{index}"
+        names.append(name)
+        plans.append(declaration)
+        collective = CollectiveRequirement(key=name, ranks=ranks)
+        requests.append(
+            declaration.request(
+                name=name,
+                collective=collective,
+                prepare_call=lambda state, inp=inp, residual=residual, weight=weight, out=out: _prepare_fused_call(
+                    state, inp=inp, residual=residual, weight=weight, out=out,
+                    residual_out=residual, epsilon=epsilon,
+                ),
+            )
+        )
+    session = PreparationSession(device=channel.device, autotune=False)
+    session.prepare(
+        tuple(requests),
+        coordinator=lambda progress: next(
+            (n for n in names if n in progress.ready_collectives), None
+        ),
+    )
+    return session, plans
+
+
+def _prepare_plain_execution(channel, inp, out, *, name):
+    """Build the real collective preparation request for a plain all-reduce."""
+    query = query_from_runtime(
+        channel, surface="OneshotAllReducePool.all_reduce", call={"inp": inp},
+    )
+    declaration = oneshot_plan(query, runtime=channel)
+    ranks = tuple(range(dist.get_world_size()))
+    collective = CollectiveRequirement(key=name, ranks=ranks)
+    request = declaration.request(
+        name=name,
+        collective=collective,
+        prepare_call=lambda state: _prepare_plain_call(
+            state, inp=inp, out=out,
+        ),
+    )
+    session = PreparationSession(device=channel.device, autotune=False)
+    result = session.prepare(
+        (request,),
+        coordinator=lambda progress: collective.key if progress.ready_collectives else None,
+    )
+    return session, result, declaration
 
 
 def _run_eager(
@@ -403,26 +465,26 @@ def _run_tp8_graph_mode_transition(
         out = torch.empty_like(inp)
         calls.append((inp, residual, weight, out))
         modes.append(_CuTeOneshotBackend._fused_launch_config(state, inp)[0])
-        with torch.cuda.stream(stream):
-            channel.prepare_graph_fused_add_rms_norm(inp)
     assert modes == ["stage_pull", "stage_tp8_owner"]
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with (
-        pool.capture(stream=stream, channel_id=channel_id),
-        torch.cuda.graph(graph, stream=stream),
-    ):
-        for inp, residual, weight, out in calls:
-            pool.all_reduce_fused_add_rms_norm(
-                inp,
-                residual,
-                weight,
-                epsilon,
-                out=out,
-                residual_out=residual,
-                stream=stream,
-                channel_id=channel_id,
-            )
+    with pool.capture(stream=stream, channel_id=channel_id):
+        session, plans = _prepare_fused_executions(
+            channel, calls, epsilon, prefix=channel_id,
+        )
+        with torch.cuda.graph(graph, stream=stream):
+            for (inp, residual, weight, out), plan in zip(calls, plans, strict=True):
+                pool.all_reduce_fused_add_rms_norm(
+                    inp,
+                    residual,
+                    weight,
+                    epsilon,
+                    plan=plan,
+                    out=out,
+                    residual_out=residual,
+                    stream=stream,
+                    channel_id=channel_id,
+                )
 
     for replay in range(3):
         expected = []
@@ -447,6 +509,7 @@ def _run_tp8_graph_mode_transition(
         ) in zip(calls, expected, strict=True):
             _assert_close(out, expected_out, dtype)
             _assert_close(residual, expected_residual, dtype)
+    session.close()
 
 
 def _run_tp8_split_view_graph(
@@ -475,25 +538,56 @@ def _run_tp8_split_view_graph(
         assert residual.stride() == (hidden_size * 2, 1)
         out = torch.empty_like(inp)
         calls.append((inp, residual, weight, padding, out))
-        with torch.cuda.stream(stream):
-            channel.prepare_graph_fused_add_rms_norm(inp)
 
     graph = torch.cuda.CUDAGraph()
-    with (
-        pool.capture(stream=stream, channel_id=channel_id),
-        torch.cuda.graph(graph, stream=stream),
-    ):
-        for inp, residual, weight, _padding, out in calls:
-            pool.all_reduce_fused_add_rms_norm(
-                inp,
-                residual,
-                weight,
-                epsilon,
-                out=out,
-                residual_out=residual,
-                stream=stream,
-                channel_id=channel_id,
+    with pool.capture(stream=stream, channel_id=channel_id):
+        ranks = tuple(range(dist.get_world_size()))
+        names = []
+        requests = []
+        plans = []
+        for index, (inp, residual, weight, _padding, out) in enumerate(calls):
+            query = query_from_runtime(
+                channel,
+                surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
+                call={"inp": inp},
             )
+            declaration = oneshot_plan(query, runtime=channel)
+            name = f"{channel_id}:{index}"
+            names.append(name)
+            plans.append(declaration)
+            collective = CollectiveRequirement(key=name, ranks=ranks)
+            requests.append(
+                declaration.request(
+                    name=name,
+                    collective=collective,
+                    prepare_call=lambda state, inp=inp, residual=residual, weight=weight, out=out: _prepare_fused_call(
+                        state, inp=inp, residual=residual, weight=weight, out=out,
+                        residual_out=residual, epsilon=epsilon,
+                    ),
+                )
+            )
+        session = PreparationSession(device=channel.device, autotune=False)
+        session.prepare(
+            tuple(requests),
+            coordinator=lambda progress: next(
+                (n for n in names if n in progress.ready_collectives), None
+            ),
+        )
+        with torch.cuda.graph(graph, stream=stream):
+            for (inp, residual, weight, _padding, out), plan in zip(
+                calls, plans, strict=True
+            ):
+                pool.all_reduce_fused_add_rms_norm(
+                    inp,
+                    residual,
+                    weight,
+                    epsilon,
+                    plan=plan,
+                    out=out,
+                    residual_out=residual,
+                    stream=stream,
+                    channel_id=channel_id,
+                )
 
     for replay in range(3):
         expected = []
@@ -524,6 +618,7 @@ def _run_tp8_split_view_graph(
             _assert_close(out, expected_out, dtype)
             _assert_close(residual, expected_residual, dtype)
             assert torch.all(padding == -7.0)
+    session.close()
 
 
 def _run_pdl_dependent(
@@ -550,15 +645,26 @@ def _run_pdl_dependent(
     plain_out = torch.empty_like(inp)
     dependent_out = torch.empty_like(inp)
 
-    def plain(channel_id="eager:fused-rmsnorm", stream=None):
-        pool.all_reduce(inp, out=plain_out, stream=stream, channel_id=channel_id)
+    eager_channel = pool.for_stream(channel_id="eager:fused-rmsnorm")
+    plain_session, _plain_result, plain_plan = _prepare_plain_execution(
+        eager_channel, inp, plain_out, name="eager:pdl-plain",
+    )
+    fused_session, _fused_result, fused_plan, _fused_out = _prepare_fused_execution(
+        eager_channel, inp, residual, weight, epsilon, name="eager:pdl-fused",
+    )
 
-    def fused(channel_id="eager:fused-rmsnorm", stream=None):
+    def plain(channel_id="eager:fused-rmsnorm", stream=None, plan=plain_plan):
+        pool.all_reduce(
+            inp, plan=plan, out=plain_out, stream=stream, channel_id=channel_id,
+        )
+
+    def fused(channel_id="eager:fused-rmsnorm", stream=None, plan=fused_plan):
         pool.all_reduce_fused_add_rms_norm(
             inp,
             residual,
             weight,
             epsilon,
+            plan=plan,
             out=out,
             residual_out=residual_out,
             stream=stream,
@@ -618,19 +724,22 @@ def _run_pdl_dependent(
             graph_channel = f"graph:pdl-{name}-{'attr' if use_pdl else 'noattr'}"
             stream = torch.cuda.Stream(device)
             channel = pool.for_stream(stream, channel_id=graph_channel)
-            with torch.cuda.stream(stream):
-                if name == "plain":
-                    channel.prepare_graph_all_reduce(inp)
-                else:
-                    channel.prepare_graph_fused_add_rms_norm(inp)
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
-            with (
-                pool.capture(stream=stream, channel_id=graph_channel),
-                torch.cuda.graph(graph, stream=stream),
-            ):
-                allreduce(graph_channel, stream)
-                copy(produced, dependent_out, use_pdl)
+            with pool.capture(stream=stream, channel_id=graph_channel):
+                if name == "plain":
+                    session_g, _result_g, graph_plan = _prepare_plain_execution(
+                        channel, inp, plain_out, name=f"{graph_channel}:plain",
+                    )
+                else:
+                    session_g, _result_g, graph_plan, _out_g = _prepare_fused_execution(
+                        channel, inp, residual, weight, epsilon,
+                        name=f"{graph_channel}:fused",
+                    )
+                with torch.cuda.graph(graph, stream=stream):
+                    allreduce(graph_channel, stream, plan=graph_plan)
+                    copy(produced, dependent_out, use_pdl)
+            session_g.close()
             for iteration in range(iterations):
                 reference, alone = expected(1000 + iteration, name, allreduce, produced)
                 dependent_out.zero_()
@@ -652,6 +761,8 @@ def _run_pdl_dependent(
             del graph
             torch.cuda.synchronize(device)
             dist.barrier()
+    plain_session.close()
+    fused_session.close()
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
